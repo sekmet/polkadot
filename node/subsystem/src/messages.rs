@@ -134,6 +134,12 @@ pub enum BitfieldDistributionMessage {
 	NetworkBridgeUpdate(NetworkBridgeEvent),
 }
 
+/// Bitfield Signing Message
+///
+/// Currently non-instantiable.
+#[derive(Debug)]
+pub enum BitfieldSigningMessage {}
+
 /// Availability store subsystem message.
 #[derive(Debug)]
 pub enum AvailabilityStoreMessage {
@@ -228,6 +234,8 @@ pub enum AllMessages {
 	AvailabilityDistribution(AvailabilityDistributionMessage),
 	/// Message for the bitfield distribution subsystem.
 	BitfieldDistribution(BitfieldDistributionMessage),
+	/// Message for the bitfield signing subsystem.
+	BitfieldSigning(BitfieldSigningMessage),
 	/// Message for the Provisioner subsystem.
 	Provisioner(ProvisionerMessage),
 	/// Message for the Runtime API subsystem.
