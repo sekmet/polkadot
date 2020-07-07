@@ -16,7 +16,7 @@
 
 //! The bitfield signing subsystem produces `SignedAvailabilityBitfield`s once per block.
 
-use futures::{channel::oneshot, future::abortable, Future};
+use futures::{channel::oneshot, future::{abortable, AbortHandle}, Future};
 use polkadot_node_subsystem::{
 	messages::{AllMessages, BitfieldSigningMessage},
 	OverseerSignal, SubsystemResult,
@@ -25,14 +25,27 @@ use polkadot_node_subsystem::{FromOverseer, SpawnedSubsystem, Subsystem, Subsyst
 use polkadot_primitives::Hash;
 use std::{collections::HashMap, pin::Pin};
 
+#[derive(Debug, Default)]
+struct JobCanceler(HashMap<Hash, AbortHandle>);
+
+// AbortHandle doesn't impl Drop on its own, so we wrap it
+// in this struct to get free cancellation on drop.
+impl Drop for JobCanceler {
+	fn drop(&mut self) {
+		for abort_handle in self.0.values() {
+			abort_handle.abort();
+		}
+	}
+}
+
 struct BitfieldSigning;
 
 impl BitfieldSigning {
-	async fn run<Context>(mut ctx: Context)
+	async fn run<Context>(mut ctx: Context) -> SubsystemResult<()>
 	where
 		Context: SubsystemContext<Message = BitfieldSigningMessage>,
 	{
-		let mut active_jobs = HashMap::new();
+		let mut active_jobs = JobCanceler::default();
 
 		loop {
 			use FromOverseer::*;
@@ -48,21 +61,22 @@ impl BitfieldSigning {
 					let future = async move {
 						let _ = future.await;
 					};
-					active_jobs.insert(hash.clone(), abort_handle);
-					ctx.spawn(Box::pin(future));
+					active_jobs.0.insert(hash.clone(), abort_handle);
+					ctx.spawn(Box::pin(future)).await?;
 				}
 				Ok(Signal(StopWork(hash))) => {
-					if let Some(abort_handle) = active_jobs.remove(&hash) {
+					if let Some(abort_handle) = active_jobs.0.remove(&hash) {
 						abort_handle.abort();
 					}
 				}
 				Ok(Signal(Conclude)) => break,
 				Err(err) => {
-					log::warn!("{:?}", err);
-					break;
+					return Err(err);
 				}
 			}
 		}
+
+		Ok(())
 	}
 }
 
@@ -72,7 +86,9 @@ where
 {
 	fn start(self, ctx: Context) -> SpawnedSubsystem {
 		SpawnedSubsystem(Box::pin(async move {
-			Self::run(ctx).await;
+			if let Err(err) = Self::run(ctx).await {
+				log::error!("{:?}", err);
+			};
 		}))
 	}
 }
