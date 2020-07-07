@@ -16,7 +16,7 @@
 
 //! The bitfield signing subsystem produces `SignedAvailabilityBitfield`s once per block.
 
-use futures::{channel::oneshot, Future};
+use futures::{channel::oneshot, future::abortable, Future};
 use polkadot_node_subsystem::{
 	messages::{AllMessages, BitfieldSigningMessage},
 	OverseerSignal, SubsystemResult,
@@ -35,31 +35,33 @@ impl BitfieldSigning {
 		let mut active_jobs = HashMap::new();
 
 		loop {
-			{
-				use FromOverseer::*;
-				use OverseerSignal::*;
-				match ctx.recv().await {
-					Ok(Communication { msg: _ }) => {
-						unreachable!("BitfieldSigningMessage is uninstantiable; qed")
-					}
-					Ok(Signal(StartWork(hash))) => {
-						active_jobs.insert(hash.clone(), bitfield_signing_job(hash));
-					}
-					Ok(Signal(StopWork(hash))) => {
-						active_jobs.remove(&hash);
-					}
-					Ok(Signal(Conclude)) => break,
-					Err(err) => {
-						log::warn!("{:?}", err);
-						break;
+			use FromOverseer::*;
+			use OverseerSignal::*;
+			match ctx.recv().await {
+				Ok(Communication { msg: _ }) => {
+					unreachable!("BitfieldSigningMessage is uninstantiable; qed")
+				}
+				Ok(Signal(StartWork(hash))) => {
+					let (future, abort_handle) = abortable(bitfield_signing_job(hash.clone()));
+					// future currently returns a Result based on whether or not it was aborted;
+					// let's ignore all that and return () unconditionally, to fit the interface.
+					let future = async move {
+						let _ = future.await;
+					};
+					active_jobs.insert(hash.clone(), abort_handle);
+					ctx.spawn(Box::pin(future));
+				}
+				Ok(Signal(StopWork(hash))) => {
+					if let Some(abort_handle) = active_jobs.remove(&hash) {
+						abort_handle.abort();
 					}
 				}
+				Ok(Signal(Conclude)) => break,
+				Err(err) => {
+					log::warn!("{:?}", err);
+					break;
+				}
 			}
-
-			// prune the active jobs list, removing the completed ones.
-			// this discards the results of ready futures, but all futures
-			// created with ctx.spawn have Output=SubsystemResult<()>, so that's fine.
-			active_jobs.retain(|_, future| future.poll().is_pending());
 		}
 	}
 }
@@ -75,7 +77,7 @@ where
 	}
 }
 
-fn bitfield_signing_job(hash: Hash) -> Pin<Box<dyn Future<Output = SubsystemResult<()>> + Send>> {
+async fn bitfield_signing_job(hash: Hash) {
 	// let (tx, _) = oneshot::channel();
 
 	// ctx.send_message(AllMessages::CandidateValidation(
