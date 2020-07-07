@@ -16,15 +16,28 @@
 
 //! The bitfield signing subsystem produces `SignedAvailabilityBitfield`s once per block.
 
-use futures::{channel::oneshot, future::{abortable, AbortHandle}, Future};
+use futures::{
+	channel::{mpsc, oneshot},
+	future::{abortable, AbortHandle},
+	prelude::*,
+	Future,
+};
 use polkadot_node_subsystem::{
 	messages::{AllMessages, BitfieldSigningMessage},
 	OverseerSignal, SubsystemResult,
 };
 use polkadot_node_subsystem::{FromOverseer, SpawnedSubsystem, Subsystem, SubsystemContext};
 use polkadot_primitives::Hash;
-use std::{collections::HashMap, pin::Pin};
+use std::{
+	collections::HashMap,
+	pin::Pin,
+	time::{Duration, Instant},
+};
 
+/// Delay between starting a bitfield signing job and its attempting to create a bitfield.
+const JOB_DELAY: Duration = Duration::from_millis(1500);
+
+/// JobCanceler aborts all abort handles on drop.
 #[derive(Debug, Default)]
 struct JobCanceler(HashMap<Hash, AbortHandle>);
 
@@ -38,12 +51,13 @@ impl Drop for JobCanceler {
 	}
 }
 
+/// Bitfield signing subsystem.
 struct BitfieldSigning;
 
 impl BitfieldSigning {
 	async fn run<Context>(mut ctx: Context) -> SubsystemResult<()>
 	where
-		Context: SubsystemContext<Message = BitfieldSigningMessage>,
+		Context: SubsystemContext<Message = BitfieldSigningMessage> + Clone,
 	{
 		let mut active_jobs = JobCanceler::default();
 
@@ -55,7 +69,8 @@ impl BitfieldSigning {
 					unreachable!("BitfieldSigningMessage is uninstantiable; qed")
 				}
 				Ok(Signal(StartWork(hash))) => {
-					let (future, abort_handle) = abortable(bitfield_signing_job(hash.clone()));
+					let (future, abort_handle) =
+						abortable(bitfield_signing_job(hash.clone(), ctx.clone()));
 					// future currently returns a Result based on whether or not it was aborted;
 					// let's ignore all that and return () unconditionally, to fit the interface.
 					let future = async move {
@@ -82,7 +97,7 @@ impl BitfieldSigning {
 
 impl<Context> Subsystem<Context> for BitfieldSigning
 where
-	Context: SubsystemContext<Message = BitfieldSigningMessage>,
+	Context: SubsystemContext<Message = BitfieldSigningMessage> + Clone,
 {
 	fn start(self, ctx: Context) -> SpawnedSubsystem {
 		SpawnedSubsystem(Box::pin(async move {
@@ -93,7 +108,18 @@ where
 	}
 }
 
-async fn bitfield_signing_job(hash: Hash) {
+async fn bitfield_signing_job<Context>(hash: Hash, ctx: Context)
+where
+	Context: SubsystemContext<Message = BitfieldSigningMessage>,
+{
+	// first up, figure out when we need to wait until
+	let delay = wasm_timer::Delay::new_at(Instant::now() + JOB_DELAY);
+	// next, do some prerequisite work
+	todo!();
+	// now, wait for the delay to be complete
+	if let Err(_) = delay.await {
+		return;
+	}
 	// let (tx, _) = oneshot::channel();
 
 	// ctx.send_message(AllMessages::CandidateValidation(

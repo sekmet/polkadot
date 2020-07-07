@@ -4424,6 +4424,7 @@ dependencies = [
  "log 0.4.8",
  "polkadot-node-subsystem",
  "polkadot-primitives",
+ "wasm-timer",
 ]
 
 [[package]]
