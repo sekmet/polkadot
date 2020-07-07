@@ -66,11 +66,11 @@ impl BitfieldSigning {
 	}
 }
 
-impl<C> Subsystem<C> for BitfieldSigning
+impl<Context> Subsystem<Context> for BitfieldSigning
 where
-	C: SubsystemContext<Message = BitfieldSigningMessage>,
+	Context: SubsystemContext<Message = BitfieldSigningMessage>,
 {
-	fn start(self, ctx: C) -> SpawnedSubsystem {
+	fn start(self, ctx: Context) -> SpawnedSubsystem {
 		SpawnedSubsystem(Box::pin(async move {
 			Self::run(ctx).await;
 		}))
