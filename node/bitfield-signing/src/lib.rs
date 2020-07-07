@@ -40,7 +40,7 @@ impl BitfieldSigning {
 				use OverseerSignal::*;
 				match ctx.recv().await {
 					Ok(Communication { msg: _ }) => {
-						unreachable!("BitfieldSigningMessage is ininstantiable")
+						unreachable!("BitfieldSigningMessage is uninstantiable; qed")
 					}
 					Ok(Signal(StartWork(hash))) => {
 						active_jobs.insert(hash.clone(), bitfield_signing_job(hash));
