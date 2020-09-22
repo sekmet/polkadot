@@ -4,21 +4,20 @@ This subsystem is responsible for distributing PoV blocks. For now, unified with
 
 ## Protocol
 
-`ProtocolId`: `b"povd"`
+`PeerSet`: `Validation`
 
 Input: [`PoVDistributionMessage`](../../types/overseer-protocol.md#pov-distribution-message)
 
 
 Output:
 
-- NetworkBridge::RegisterEventProducer(`ProtocolId`)
-- NetworkBridge::SendMessage(`[PeerId]`, `ProtocolId`, `Bytes`)
+- NetworkBridge::SendMessage(`[PeerId]`, message)
 - NetworkBridge::ReportPeer(PeerId, cost_or_benefit)
 
 
 ## Functionality
 
-This network protocol is responsible for distributing [`PoV`s](../../types/availability.md#proof-of-validity) by gossip. Since PoVs are heavy in practice, gossip is far from the most efficient way to distribute them. In the future, this should be replaced by a better network protocol that finds validators who have validated the block and connects to them directly. This protocol is descrbied
+This network protocol is responsible for distributing [`PoV`s](../../types/availability.md#proof-of-validity) by gossip. Since PoVs are heavy in practice, gossip is far from the most efficient way to distribute them. In the future, this should be replaced by a better network protocol that finds validators who have validated the block and connects to them directly. This protocol is descrbied.
 
 This protocol is described in terms of "us" and our peers, with the understanding that this is the procedure that any honest node will run. It has the following goals:
   - We never have to buffer an unbounded amount of data
@@ -30,7 +29,7 @@ For this, in order to avoid reaching into the internals of the [Statement Distri
 
 The view update mechanism of the [Network Bridge](../utility/network-bridge.md) ensures that peers are only allowed to consider a certain set of relay-parents as live. So this bounding mechanism caps the amount of data we need to store per peer at any time at `sum({ 2 * n_validators_at_head(head) * sizeof(hash) for head in view_heads })`. Additionally, peers should only be allowed to notify us of PoV hashes they are waiting for in the context of relay-parents in our own local view, which means that `n_validators_at_head` is implied to be `0` for relay-parents not in our own local view.
 
-View updates from peers and our own view updates are received from the network bridge. These will lag somewhat behind the `StartWork` and `StopWork` messages received from the overseer, which will influence the actual data we store. The `OurViewUpdate`s from the [`NetworkBridgeEvent`](../../types/overseer-protocol.md#network-bridge-update) must be considered canonical in terms of our peers' perception of us.
+View updates from peers and our own view updates are received from the network bridge. These will lag somewhat behind the `ActiveLeavesUpdate` messages received from the overseer, which will influence the actual data we store. The `OurViewUpdate`s from the [`NetworkBridgeEvent`](../../types/overseer-protocol.md#network-bridge-update) must be considered canonical in terms of our peers' perception of us.
 
 Lastly, the system needs to be bootstrapped with our own perception of which PoVs we are cognizant of but awaiting data for. This is done by receipt of the [`PoVDistributionMessage`](../../types/overseer-protocol.md#pov-distribution-message)::FetchPoV variant. Proper operation of this subsystem depends on the descriptors passed faithfully representing candidates which have been seconded by other validators.
 
@@ -56,28 +55,18 @@ struct PeerState {
 }
 ```
 
-We also assume the following network messages, which are sent and received by the [Network Bridge](../utility/network-bridge.md)
-
-```rust
-enum NetworkMessage {
-	/// Notification that we are awaiting the given PoVs (by hash) against a
-	/// specific relay-parent hash.
-	Awaiting(Hash, Vec<Hash>),
-	/// Notification of an awaited PoV, in a given relay-parent context.
-	/// (relay_parent, pov_hash, pov)
-	SendPoV(Hash, Hash, PoV),
-}
-```
+We also use the [`PoVDistributionV1Message`](../../types/network.md#pov-distribution) as our `NetworkMessage`, which are sent and received by the [Network Bridge](../utility/network-bridge.md)
 
 Here is the logic of the state machine:
 
 *Overseer Signals*
-- On `StartWork(relay_parent)`:
-	- Get the number of validators at that relay parent by querying the [Runtime API](../utility/runtime-api.md) for the validators and then counting them.
-	- Create a blank entry in `relay_parent_state` under `relay_parent` with correct `n_validators` set.
-- On `StopWork(relay_parent)`:
-	- Remove the entry for `relay_parent` from `relay_parent_state`.
-- On `Concluded`: conclude.
+- On `ActiveLeavesUpdate(relay_parent)`:
+	- For each relay-parent in the `activated` list:
+		- Get the number of validators at that relay parent by querying the [Runtime API](../utility/runtime-api.md) for the validators and then counting them.
+		- Create a blank entry in `relay_parent_state` under `relay_parent` with correct `n_validators` set.
+	- For each relay-parent in the `deactivated` list:
+		- Remove the entry for `relay_parent` from `relay_parent_state`.
+- On `Conclude`: conclude.
 
 *PoV Distribution Messages*
 - On `FetchPoV(relay_parent, descriptor, response_channel)`
@@ -101,7 +90,7 @@ Here is the logic of the state machine:
 	- If this is `NetworkMessage::Awaiting(relay_parent, pov_hashes)`:
 		- If there is no entry under `peer_state.awaited` for the `relay_parent`, report and ignore.
 		- If `relay_parent` is not contained within `our_view`, report and ignore.
-		- Otherwise, if the peer's `awaited` map combined with the `pov_hashes` would have more than ` 2 * relay_parent_state[relay_parent].n_validators` entries, report and ignore. Note that we are leaning on the property of the network bridge that it sets our view based on `StartWork` messages.
+		- Otherwise, if the peer's `awaited` map combined with the `pov_hashes` would have more than ` 2 * relay_parent_state[relay_parent].n_validators` entries, report and ignore. Note that we are leaning on the property of the network bridge that it sets our view based on `activated` heads in `ActiveLeavesUpdate` signals.
 		- For each new `pov_hash` in `pov_hashes`, if there is a `pov` under `pov_hash` in the `known` map, send the peer a `NetworkMessage::SendPoV(relay_parent, pov_hash, pov)`.
 		- Otherwise, add the `pov_hash` to the `awaited` map
 	- If this is `NetworkMessage::SendPoV(relay_parent, pov_hash, pov)`:

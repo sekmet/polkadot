@@ -16,71 +16,75 @@
 
 //! Basic parachain that adds a number as part of its state.
 
+const WORKER_ARGS_TEST: &[&'static str] = &["--nocapture", "validation_worker"];
+
 use crate::adder;
 use parachain::{
 	primitives::{BlockData, ValidationParams},
-	wasm_executor::EXECUTION_TIMEOUT_SEC,
+	wasm_executor::{ValidationError, InvalidCandidate, EXECUTION_TIMEOUT_SEC, ExecutionMode, ValidationPool},
 };
 
-// Code that exposes `validate_block` and loops infinitely
-const INFINITE_LOOP_CODE: &[u8] = halt::WASM_BINARY;
+fn execution_mode() -> ExecutionMode {
+	ExecutionMode::ExternalProcessCustomHost {
+		pool: ValidationPool::new(),
+		binary: std::env::current_exe().unwrap(),
+		args: WORKER_ARGS_TEST.iter().map(|x| x.to_string()).collect(),
+	}
+}
 
 #[test]
 fn terminates_on_timeout() {
-	let pool = parachain::wasm_executor::ValidationPool::new();
+	let execution_mode = execution_mode();
 
 	let result = parachain::wasm_executor::validate_candidate(
-		INFINITE_LOOP_CODE,
+		halt::wasm_binary_unwrap(),
 		ValidationParams {
 			block_data: BlockData(Vec::new()),
 			parent_head: Default::default(),
-			max_code_size: 1024,
-			max_head_data_size: 1024,
 			relay_chain_height: 1,
-			code_upgrade_allowed: None,
+			hrmp_mqc_heads: Vec::new(),
 		},
-		parachain::wasm_executor::ExecutionMode::RemoteTest(&pool),
+		&execution_mode,
+		sp_core::testing::TaskExecutor::new(),
 	);
 	match result {
-		Err(parachain::wasm_executor::Error::Timeout) => {},
+		Err(ValidationError::InvalidCandidate(InvalidCandidate::Timeout)) => {},
 		r => panic!("{:?}", r),
 	}
 
 	// check that another parachain can validate normaly
-	adder::execute_good_on_parent();
+	adder::execute_good_on_parent_with_external_process_validation();
 }
 
 #[test]
 fn parallel_execution() {
-	let pool = parachain::wasm_executor::ValidationPool::new();
+	let execution_mode = execution_mode();
 
 	let start = std::time::Instant::now();
 
-	let pool2 = pool.clone();
+	let execution_mode2 = execution_mode.clone();
 	let thread = std::thread::spawn(move ||
 		parachain::wasm_executor::validate_candidate(
-		INFINITE_LOOP_CODE,
+		halt::wasm_binary_unwrap(),
 		ValidationParams {
 			block_data: BlockData(Vec::new()),
 			parent_head: Default::default(),
-			max_code_size: 1024,
-			max_head_data_size: 1024,
 			relay_chain_height: 1,
-			code_upgrade_allowed: None,
+			hrmp_mqc_heads: Vec::new(),
 		},
-		parachain::wasm_executor::ExecutionMode::RemoteTest(&pool2),
+		&execution_mode,
+		sp_core::testing::TaskExecutor::new(),
 	).ok());
 	let _ = parachain::wasm_executor::validate_candidate(
-		INFINITE_LOOP_CODE,
+		halt::wasm_binary_unwrap(),
 		ValidationParams {
 			block_data: BlockData(Vec::new()),
 			parent_head: Default::default(),
-			max_code_size: 1024,
-			max_head_data_size: 1024,
 			relay_chain_height: 1,
-			code_upgrade_allowed: None,
+			hrmp_mqc_heads: Vec::new(),
 		},
-		parachain::wasm_executor::ExecutionMode::RemoteTest(&pool),
+		&execution_mode2,
+		sp_core::testing::TaskExecutor::new(),
 	);
 	thread.join().unwrap();
 	// total time should be < 2 x EXECUTION_TIMEOUT_SEC

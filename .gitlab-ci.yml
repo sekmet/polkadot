@@ -94,16 +94,12 @@ check-line-width:
   interruptible:                   true
   allow_failure:                   true
 
-publish-draft-release:
+test-deterministic-wasm:
   stage:                           test
-  only:
-    - tags
-    - /^v[0-9]+\.[0-9]+\.[0-9]+.*$/        # i.e. v1.0.1, v2.1.0rc1
+  <<:                              *docker-env
+  except:
   script:
-    - apt-get -y update; apt-get -y install jq
-    - ./scripts/gitlab/publish_draft_release.sh
-  interruptible:                   true
-  allow_failure:                   true
+    - ./scripts/gitlab/test_deterministic_wasm.sh
 
 test-linux-stable:                 &test
   stage:                           test
@@ -117,7 +113,7 @@ test-linux-stable:                 &test
     RUSTFLAGS: "-Cdebug-assertions=y -Dwarnings"
     TARGET: native
   script:
-    - time cargo test --all --release --verbose --locked --features runtime-benchmarks
+    - ./scripts/gitlab/test_linux_stable.sh
     - sccache -s
 
 check-web-wasm:                    &test
@@ -128,14 +124,7 @@ check-web-wasm:                    &test
   script:
     # WASM support is in progress. As more and more crates support WASM, we
     # should add entries here. See https://github.com/paritytech/polkadot/issues/625
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path runtime/polkadot/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path runtime/kusama/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path erasure-coding/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path parachain/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path primitives/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path rpc/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path statement-table/Cargo.toml
-    - time cargo build --locked --target=wasm32-unknown-unknown --manifest-path cli/Cargo.toml --no-default-features --features browser
+    - ./scripts/gitlab/check_web_wasm.sh
     - sccache -s
 
 check-runtime-benchmarks:          &test
@@ -145,7 +134,7 @@ check-runtime-benchmarks:          &test
   <<:                              *compiler_info
   script:
     # Check that the node will compile with `runtime-benchmarks` feature flag.
-    - time cargo check --features runtime-benchmarks
+    - ./scripts/gitlab/check_runtime_benchmarks.sh
     - sccache -s
 
 build-wasm-release:
@@ -188,6 +177,18 @@ build-linux-release:               &build
     - cp -r scripts/docker/* ./artifacts
     - sccache -s
 
+build-linux-release-pr:            &build
+  stage:                           build
+  <<:                              *collect-artifacts
+  <<:                              *test-refs
+  <<:                              *docker-env
+  <<:                              *compiler_info
+  script:
+    - time cargo build --release --verbose
+    - mkdir -p ./artifacts
+    - mv ./target/release/polkadot ./artifacts/.
+    - sha256sum ./artifacts/polkadot | tee ./artifacts/polkadot.sha256
+  when: manual
 
 generate-impl-guide:
   stage:                          build

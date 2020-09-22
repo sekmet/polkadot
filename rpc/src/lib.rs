@@ -23,13 +23,14 @@ use std::sync::Arc;
 use polkadot_primitives::v0::{Block, BlockNumber, AccountId, Nonce, Balance, Hash};
 use sp_api::ProvideRuntimeApi;
 use txpool_api::TransactionPool;
+use sp_block_builder::BlockBuilder;
 use sp_blockchain::{HeaderBackend, HeaderMetadata, Error as BlockChainError};
 use sp_consensus::SelectChain;
 use sp_consensus_babe::BabeApi;
 use sc_client_api::light::{Fetcher, RemoteBlockchain};
 use sc_consensus_babe::Epoch;
-use sc_rpc::DenyUnsafe;
-use sp_block_builder::BlockBuilder;
+use sc_finality_grandpa::FinalityProofProvider;
+pub use sc_rpc::{DenyUnsafe, SubscriptionTaskExecutor};
 
 /// A type representing all RPC extensions.
 pub type RpcExtension = jsonrpc_core::IoHandler<sc_rpc::Metadata>;
@@ -57,15 +58,21 @@ pub struct BabeDeps {
 }
 
 /// Dependencies for GRANDPA
-pub struct GrandpaDeps {
+pub struct GrandpaDeps<B> {
 	/// Voting round info.
 	pub shared_voter_state: sc_finality_grandpa::SharedVoterState,
 	/// Authority set info.
 	pub shared_authority_set: sc_finality_grandpa::SharedAuthoritySet<Hash, BlockNumber>,
+	/// Receives notifications about justification events from Grandpa.
+	pub justification_stream: sc_finality_grandpa::GrandpaJustificationStream<Block>,
+	/// Executor to drive the subscription manager in the Grandpa RPC handler.
+	pub subscription_executor: sc_rpc::SubscriptionTaskExecutor,
+	/// Finality proof provider.
+	pub finality_provider: Arc<FinalityProofProvider<B, Block>>,
 }
 
 /// Full client dependencies
-pub struct FullDeps<C, P, SC> {
+pub struct FullDeps<C, P, SC, B> {
 	/// The client instance to use.
 	pub client: Arc<C>,
 	/// Transaction pool instance.
@@ -77,21 +84,22 @@ pub struct FullDeps<C, P, SC> {
 	/// BABE specific dependencies.
 	pub babe: BabeDeps,
 	/// GRANDPA specific dependencies.
-	pub grandpa: GrandpaDeps,
+	pub grandpa: GrandpaDeps<B>,
 }
 
 /// Instantiate all RPC extensions.
-pub fn create_full<C, P, UE, SC>(deps: FullDeps<C, P, SC>) -> RpcExtension where
+pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> RpcExtension where
 	C: ProvideRuntimeApi<Block>,
 	C: HeaderBackend<Block> + HeaderMetadata<Block, Error=BlockChainError>,
 	C: Send + Sync + 'static,
 	C::Api: frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
-	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance, UE>,
+	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
 	C::Api: BabeApi<Block>,
 	C::Api: BlockBuilder<Block>,
 	P: TransactionPool + Sync + Send + 'static,
-	UE: codec::Codec + Send + Sync + 'static,
 	SC: SelectChain<Block> + 'static,
+	B: sc_client_api::Backend<Block> + Send + Sync + 'static,
+	B::State: sc_client_api::StateBackend<sp_runtime::traits::HashFor<Block>>,
 {
 	use frame_rpc_system::{FullSystem, SystemApi};
 	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
@@ -115,6 +123,9 @@ pub fn create_full<C, P, UE, SC>(deps: FullDeps<C, P, SC>) -> RpcExtension where
 	let GrandpaDeps {
 		shared_voter_state,
 		shared_authority_set,
+		justification_stream,
+		subscription_executor,
+		finality_provider,
 	} = grandpa;
 
 	io.extend_with(
@@ -139,22 +150,24 @@ pub fn create_full<C, P, UE, SC>(deps: FullDeps<C, P, SC>) -> RpcExtension where
 		GrandpaApi::to_delegate(GrandpaRpcHandler::new(
 			shared_authority_set,
 			shared_voter_state,
+			justification_stream,
+			subscription_executor,
+			finality_provider,
 		))
 	);
 	io
 }
 
 /// Instantiate all RPC extensions for light node.
-pub fn create_light<C, P, F, UE>(deps: LightDeps<C, F, P>) -> RpcExtension
+pub fn create_light<C, P, F>(deps: LightDeps<C, F, P>) -> RpcExtension
 	where
 		C: ProvideRuntimeApi<Block>,
 		C: HeaderBackend<Block>,
 		C: Send + Sync + 'static,
 		C::Api: frame_rpc_system::AccountNonceApi<Block, AccountId, Nonce>,
-		C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance, UE>,
+		C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
 		P: TransactionPool + Sync + Send + 'static,
 		F: Fetcher<Block> + 'static,
-		UE: codec::Codec + Send + Sync + 'static,
 {
 	use frame_rpc_system::{LightSystem, SystemApi};
 

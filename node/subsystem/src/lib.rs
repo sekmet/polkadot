@@ -19,6 +19,8 @@
 //! Node-side logic for Polkadot is mostly comprised of Subsystems, which are discrete components
 //! that communicate via message-passing. They are coordinated by an overseer, provided by a
 //! separate crate.
+//!
+//! This crate also reexports Prometheus metric types which are expected to be implemented by subsystems.
 
 #![warn(missing_docs)]
 
@@ -30,19 +32,60 @@ use futures::future::BoxFuture;
 
 use polkadot_primitives::v1::Hash;
 use async_trait::async_trait;
+use smallvec::SmallVec;
 
 use crate::messages::AllMessages;
 
+pub mod errors;
 pub mod messages;
-pub mod util;
+
+/// How many slots are stack-reserved for active leaves updates
+///
+/// If there are fewer than this number of slots, then we've wasted some stack space.
+/// If there are greater than this number of slots, then we fall back to a heap vector.
+const ACTIVE_LEAVES_SMALLVEC_CAPACITY: usize = 8;
+
+/// Changes in the set of active leaves: the parachain heads which we care to work on.
+///
+/// Note that the activated and deactivated fields indicate deltas, not complete sets.
+#[derive(Clone, Debug, Default, Eq)]
+pub struct ActiveLeavesUpdate {
+	/// New relay chain block hashes of interest.
+	pub activated: SmallVec<[Hash; ACTIVE_LEAVES_SMALLVEC_CAPACITY]>,
+	/// Relay chain block hashes no longer of interest.
+	pub deactivated: SmallVec<[Hash; ACTIVE_LEAVES_SMALLVEC_CAPACITY]>,
+}
+
+impl ActiveLeavesUpdate {
+	/// Create a ActiveLeavesUpdate with a single activated hash
+	pub fn start_work(hash: Hash) -> Self {
+		Self { activated: [hash].as_ref().into(), ..Default::default() }
+	}
+
+	/// Create a ActiveLeavesUpdate with a single deactivated hash
+	pub fn stop_work(hash: Hash) -> Self {
+		Self { deactivated: [hash].as_ref().into(), ..Default::default() }
+	}
+}
+
+impl PartialEq for ActiveLeavesUpdate {
+	/// Equality for `ActiveLeavesUpdate` doesnt imply bitwise equality.
+	///
+	/// Instead, it means equality when `activated` and `deactivated` are considered as sets.
+	fn eq(&self, other: &Self) -> bool {
+		use std::collections::HashSet;
+		self.activated.iter().collect::<HashSet<_>>() == other.activated.iter().collect::<HashSet<_>>() &&
+			self.deactivated.iter().collect::<HashSet<_>>() == other.deactivated.iter().collect::<HashSet<_>>()
+	}
+}
 
 /// Signals sent by an overseer to a subsystem.
 #[derive(PartialEq, Clone, Debug)]
 pub enum OverseerSignal {
-	/// `Subsystem` should start working on block-based work, given by the relay-chain block hash.
-	StartWork(Hash),
-	/// `Subsystem` should stop working on block-based work specified by the relay-chain block hash.
-	StopWork(Hash),
+	/// Subsystems should adjust their jobs to start and stop work on appropriate block hashes.
+	ActiveLeaves(ActiveLeavesUpdate),
+	/// `Subsystem` is informed of a finalized block by its block hash.
+	BlockFinalized(Hash),
 	/// Conclude the work of the `Overseer` and all `Subsystem`s.
 	Conclude,
 }
@@ -71,7 +114,7 @@ pub enum FromOverseer<M> {
 ///   * Subsystems dying when they are not expected to
 ///   * Subsystems not dying when they are told to die
 ///   * etc.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubsystemError;
 
 impl From<mpsc::SendError> for SubsystemError {
@@ -87,9 +130,9 @@ impl From<oneshot::Canceled> for SubsystemError {
 }
 
 impl From<futures::task::SpawnError> for SubsystemError {
-    fn from(_: futures::task::SpawnError) -> Self {
+	fn from(_: futures::task::SpawnError) -> Self {
 		Self
-    }
+	}
 }
 
 impl From<std::convert::Infallible> for SubsystemError {
@@ -101,7 +144,12 @@ impl From<std::convert::Infallible> for SubsystemError {
 /// An asynchronous subsystem task..
 ///
 /// In essence it's just a newtype wrapping a `BoxFuture`.
-pub struct SpawnedSubsystem(pub BoxFuture<'static, ()>);
+pub struct SpawnedSubsystem {
+	/// Name of the subsystem being spawned.
+	pub name: &'static str,
+	/// The task of the subsystem being spawned.
+	pub future: BoxFuture<'static, ()>,
+}
 
 /// A `Result` type that wraps [`SubsystemError`].
 ///
@@ -130,7 +178,14 @@ pub trait SubsystemContext: Send + 'static {
 	async fn recv(&mut self) -> SubsystemResult<FromOverseer<Self::Message>>;
 
 	/// Spawn a child task on the executor.
-	async fn spawn(&mut self, s: Pin<Box<dyn Future<Output = ()> + Send>>) -> SubsystemResult<()>;
+	async fn spawn(&mut self, name: &'static str, s: Pin<Box<dyn Future<Output = ()> + Send>>) -> SubsystemResult<()>;
+
+	/// Spawn a blocking child task on the executor's dedicated thread pool.
+	async fn spawn_blocking(
+		&mut self,
+		name: &'static str,
+		s: Pin<Box<dyn Future<Output = ()> + Send>>,
+	) -> SubsystemResult<()>;
 
 	/// Send a direct message to some other `Subsystem`, routed based on message type.
 	async fn send_message(&mut self, msg: AllMessages) -> SubsystemResult<()>;
@@ -149,6 +204,9 @@ pub trait SubsystemContext: Send + 'static {
 /// [`Overseer`]: struct.Overseer.html
 /// [`Subsystem`]: trait.Subsystem.html
 pub trait Subsystem<C: SubsystemContext> {
+	/// Subsystem-specific Prometheus metrics.
+	type Metrics: metrics::Metrics;
+
 	/// Start this `Subsystem` and return `SpawnedSubsystem`.
 	fn start(self, ctx: C) -> SpawnedSubsystem;
 }
@@ -158,8 +216,10 @@ pub trait Subsystem<C: SubsystemContext> {
 pub struct DummySubsystem;
 
 impl<C: SubsystemContext> Subsystem<C> for DummySubsystem {
+	type Metrics = ();
+
 	fn start(self, mut ctx: C) -> SpawnedSubsystem {
-		SpawnedSubsystem(Box::pin(async move {
+		let future = Box::pin(async move {
 			loop {
 				match ctx.recv().await {
 					Ok(FromOverseer::Signal(OverseerSignal::Conclude)) => return,
@@ -167,6 +227,48 @@ impl<C: SubsystemContext> Subsystem<C> for DummySubsystem {
 					_ => continue,
 				}
 			}
-		}))
+		});
+
+		SpawnedSubsystem {
+			name: "DummySubsystem",
+			future,
+		}
+	}
+}
+
+/// This module reexports Prometheus types and defines the [`Metrics`] trait.
+pub mod metrics {
+	/// Reexport Prometheus types.
+	pub use substrate_prometheus_endpoint as prometheus;
+
+	/// Subsystem- or job-specific Prometheus metrics.
+	///
+	/// Usually implemented as a wrapper for `Option<ActualMetrics>`
+	/// to ensure `Default` bounds or as a dummy type ().
+	/// Prometheus metrics internally hold an `Arc` reference, so cloning them is fine.
+	pub trait Metrics: Default + Clone {
+		/// Try to register metrics in the Prometheus registry.
+		fn try_register(registry: &prometheus::Registry) -> Result<Self, prometheus::PrometheusError>;
+
+		/// Convience method to register metrics in the optional Prometheus registry.
+		/// If the registration fails, prints a warning and returns `Default::default()`.
+		fn register(registry: Option<&prometheus::Registry>) -> Self {
+			registry.map(|r| {
+				match Self::try_register(r) {
+					Err(e) => {
+						log::warn!("Failed to register metrics: {:?}", e);
+						Default::default()
+					},
+					Ok(metrics) => metrics,
+				}
+			}).unwrap_or_default()
+		}
+	}
+
+	// dummy impl
+	impl Metrics for () {
+		fn try_register(_registry: &prometheus::Registry) -> Result<(), prometheus::PrometheusError> {
+			Ok(())
+		}
 	}
 }

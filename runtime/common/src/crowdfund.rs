@@ -72,23 +72,23 @@ use frame_support::{
 		Currency, Get, OnUnbalanced, WithdrawReason, ExistenceRequirement::AllowDeath
 	},
 };
-use system::ensure_signed;
+use frame_system::ensure_signed;
 use sp_runtime::{ModuleId,
 	traits::{AccountIdConversion, Hash, Saturating, Zero, CheckedAdd}
 };
 use crate::slots;
 use codec::{Encode, Decode};
 use sp_std::vec::Vec;
-use primitives::v0::{Id as ParaId, HeadData};
+use primitives::v1::{Id as ParaId, HeadData};
 
 pub type BalanceOf<T> =
-	<<T as slots::Trait>::Currency as Currency<<T as system::Trait>::AccountId>>::Balance;
+	<<T as slots::Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
 #[allow(dead_code)]
 pub type NegativeImbalanceOf<T> =
-	<<T as slots::Trait>::Currency as Currency<<T as system::Trait>::AccountId>>::NegativeImbalance;
+	<<T as slots::Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::NegativeImbalance;
 
 pub trait Trait: slots::Trait {
-	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
+	type Event: From<Event<Self>> + Into<<Self as frame_system::Trait>::Event>;
 
 	/// ModuleID for the crowdfund module. An appropriate value could be ```ModuleId(*b"py/cfund")```
 	type ModuleId: Get<ModuleId>;
@@ -184,15 +184,22 @@ decl_storage! {
 
 decl_event! {
 	pub enum Event<T> where
-		<T as system::Trait>::AccountId,
+		<T as frame_system::Trait>::AccountId,
 		Balance = BalanceOf<T>,
 	{
+		/// Create a new crowdfunding campaign. [fund_index]
 		Created(FundIndex),
+		/// Contributed to a crowd sale. [who, fund_index, amount]
 		Contributed(AccountId, FundIndex, Balance),
+		/// Withdrew full balance of a contributor. [who, fund_index, amount]
 		Withdrew(AccountId, FundIndex, Balance),
+		/// Fund is placed into retirement. [fund_index]
 		Retiring(FundIndex),
+		/// Fund is dissolved. [fund_index]
 		Dissolved(FundIndex),
+		/// The deploy data of the funded parachain is setted. [fund_index]
 		DeployDataFixed(FundIndex),
+		/// Onboarding process for a winning parachain fund is completed. [find_index, parachain_id]
 		Onboarded(FundIndex, ParaId),
 	}
 }
@@ -244,7 +251,7 @@ decl_error! {
 }
 
 decl_module! {
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin, system = system {
+	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
 		type Error = Error<T>;
 
 		const ModuleId: ModuleId = T::ModuleId::get();
@@ -263,7 +270,7 @@ decl_module! {
 
 			ensure!(first_slot < last_slot, Error::<T>::LastSlotBeforeFirstSlot);
 			ensure!(last_slot <= first_slot + 3.into(), Error::<T>::LastSlotTooFarInFuture);
-			ensure!(end > <system::Module<T>>::block_number(), Error::<T>::CannotEndInPast);
+			ensure!(end > <frame_system::Module<T>>::block_number(), Error::<T>::CannotEndInPast);
 
 			let deposit = T::SubmissionDeposit::get();
 			let transfer = WithdrawReason::Transfer.into();
@@ -306,7 +313,7 @@ decl_module! {
 			ensure!(fund.raised <= fund.cap, Error::<T>::CapExceeded);
 
 			// Make sure crowdfund has not ended
-			let now = <system::Module<T>>::block_number();
+			let now = <frame_system::Module<T>>::block_number();
 			ensure!(fund.end > now, Error::<T>::ContributionPeriodOver);
 
 			T::Currency::transfer(&who, &Self::fund_account_id(index), value, AllowDeath)?;
@@ -394,7 +401,7 @@ decl_module! {
 			ensure!(fund.parachain.is_none(), Error::<T>::AlreadyOnboard);
 			fund.parachain = Some(para_id);
 
-			let fund_origin = system::RawOrigin::Signed(Self::fund_account_id(index)).into();
+			let fund_origin = frame_system::RawOrigin::Signed(Self::fund_account_id(index)).into();
 			<slots::Module<T>>::fix_deploy_data(
 				fund_origin,
 				index,
@@ -423,7 +430,7 @@ decl_module! {
 			ensure!(T::Currency::free_balance(&account) >= fund.raised, Error::<T>::FundsNotReturned);
 
 			// This fund just ended. Withdrawal period begins.
-			let now = <system::Module<T>>::block_number();
+			let now = <frame_system::Module<T>>::block_number();
 			fund.end = now;
 
 			<Funds<T>>::insert(index, &fund);
@@ -438,7 +445,7 @@ decl_module! {
 
 			let mut fund = Self::funds(index).ok_or(Error::<T>::InvalidFundIndex)?;
 			ensure!(fund.parachain.is_none(), Error::<T>::FundNotRetired);
-			let now = <system::Module<T>>::block_number();
+			let now = <frame_system::Module<T>>::block_number();
 
 			// `fund.end` can represent the end of a failed crowdsale or the beginning of retirement
 			ensure!(now >= fund.end, Error::<T>::FundNotEnded);
@@ -469,7 +476,7 @@ decl_module! {
 
 			let fund = Self::funds(index).ok_or(Error::<T>::InvalidFundIndex)?;
 			ensure!(fund.parachain.is_none(), Error::<T>::HasActiveParachain);
-			let now = <system::Module<T>>::block_number();
+			let now = <frame_system::Module<T>>::block_number();
 			ensure!(
 				now >= fund.end.saturating_add(T::RetirementPeriod::get()),
 				Error::<T>::InRetirementPeriod
@@ -568,14 +575,14 @@ mod tests {
 	};
 	use frame_support::traits::{Contains, ContainsLengthBound};
 	use sp_core::H256;
-	use primitives::v0::{Info as ParaInfo, Id as ParaId, Scheduling, ValidationCode};
+	use primitives::v1::{Id as ParaId, ValidationCode};
 	// The testing primitives are very useful for avoiding having to work with signatures
 	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are requried.
 	use sp_runtime::{
 		Perbill, Permill, Percent, testing::Header, DispatchResult,
 		traits::{BlakeTwo256, IdentityLookup},
 	};
-	use crate::registrar::Registrar;
+	use crate::slots::Registrar;
 
 	impl_outer_origin! {
 		pub enum Origin for Test {}
@@ -592,7 +599,7 @@ mod tests {
 		pub const MaximumBlockLength: u32 = 4 * 1024 * 1024;
 		pub const AvailableBlockRatio: Perbill = Perbill::from_percent(75);
 	}
-	impl system::Trait for Test {
+	impl frame_system::Trait for Test {
 		type BaseCallFilter = ();
 		type Origin = Origin;
 		type Call = ();
@@ -613,8 +620,8 @@ mod tests {
 		type MaximumBlockLength = MaximumBlockLength;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
-		type ModuleToIndex = ();
-		type AccountData = balances::AccountData<u64>;
+		type PalletInfo = ();
+		type AccountData = pallet_balances::AccountData<u64>;
 		type OnNewAccount = ();
 		type OnKilledAccount = Balances;
 		type SystemWeightInfo = ();
@@ -622,12 +629,13 @@ mod tests {
 	parameter_types! {
 		pub const ExistentialDeposit: u64 = 1;
 	}
-	impl balances::Trait for Test {
+	impl pallet_balances::Trait for Test {
 		type Balance = u64;
 		type Event = ();
 		type DustRemoval = ();
 		type ExistentialDeposit = ExistentialDeposit;
 		type AccountStore = System;
+		type MaxLocks = ();
 		type WeightInfo = ();
 	}
 
@@ -639,8 +647,14 @@ mod tests {
 		pub const TipCountdown: u64 = 1;
 		pub const TipFindersFee: Percent = Percent::from_percent(20);
 		pub const TipReportDepositBase: u64 = 1;
-		pub const TipReportDepositPerByte: u64 = 1;
 		pub const TreasuryModuleId: ModuleId = ModuleId(*b"py/trsry");
+		pub const DataDepositPerByte: u64 = 1;
+		pub const BountyDepositBase: u64 = 1;
+		pub const BountyDepositPayoutDelay: u64 = 1;
+		pub const BountyUpdatePeriod: u64 = 1;
+		pub const MaximumReasonLength: u32 = 16384;
+		pub const BountyCuratorDeposit: Permill = Permill::from_percent(50);
+		pub const BountyValueMinimum: u64 = 1;
 	}
 	pub struct Nobody;
 	impl Contains<u64> for Nobody {
@@ -653,21 +667,28 @@ mod tests {
 		fn min_len() -> usize { 0 }
 		fn max_len() -> usize { 0 }
 	}
-	impl treasury::Trait for Test {
-		type Currency = balances::Module<Test>;
-		type ApproveOrigin = system::EnsureRoot<u64>;
-		type RejectOrigin = system::EnsureRoot<u64>;
+	impl pallet_treasury::Trait for Test {
+		type Currency = pallet_balances::Module<Test>;
+		type ApproveOrigin = frame_system::EnsureRoot<u64>;
+		type RejectOrigin = frame_system::EnsureRoot<u64>;
 		type Event = ();
-		type ProposalRejection = ();
+		type OnSlash = ();
 		type ProposalBond = ProposalBond;
 		type ProposalBondMinimum = ProposalBondMinimum;
 		type SpendPeriod = SpendPeriod;
 		type Burn = Burn;
+		type BurnDestination = ();
 		type Tippers = Nobody;
 		type TipCountdown = TipCountdown;
 		type TipFindersFee = TipFindersFee;
 		type TipReportDepositBase = TipReportDepositBase;
-		type TipReportDepositPerByte = TipReportDepositPerByte;
+		type DataDepositPerByte = DataDepositPerByte;
+		type BountyDepositBase = BountyDepositBase;
+		type BountyDepositPayoutDelay = BountyDepositPayoutDelay;
+		type BountyUpdatePeriod = BountyUpdatePeriod;
+		type MaximumReasonLength = MaximumReasonLength;
+		type BountyCuratorDeposit = BountyCuratorDeposit;
+		type BountyValueMinimum = BountyValueMinimum;
 		type ModuleId = TreasuryModuleId;
 		type WeightInfo = ();
 	}
@@ -698,13 +719,9 @@ mod tests {
 			code_size <= MAX_CODE_SIZE
 		}
 
-		fn para_info(_id: ParaId) -> Option<ParaInfo> {
-			Some(ParaInfo { scheduling: Scheduling::Always })
-		}
-
 		fn register_para(
 			id: ParaId,
-			_info: ParaInfo,
+			_parachain: bool,
 			code: ValidationCode,
 			initial_head_data: HeadData,
 		) -> DispatchResult {
@@ -755,20 +772,20 @@ mod tests {
 		type ModuleId = CrowdfundModuleId;
 	}
 
-	type System = system::Module<Test>;
-	type Balances = balances::Module<Test>;
+	type System = frame_system::Module<Test>;
+	type Balances = pallet_balances::Module<Test>;
 	type Slots = slots::Module<Test>;
-	type Treasury = treasury::Module<Test>;
+	type Treasury = pallet_treasury::Module<Test>;
 	type Crowdfund = Module<Test>;
-	type RandomnessCollectiveFlip = randomness_collective_flip::Module<Test>;
-	use balances::Error as BalancesError;
+	type RandomnessCollectiveFlip = pallet_randomness_collective_flip::Module<Test>;
+	use pallet_balances::Error as BalancesError;
 	use slots::Error as SlotsError;
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mockup.
 	fn new_test_ext() -> sp_io::TestExternalities {
-		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap();
-		balances::GenesisConfig::<Test>{
+		let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		pallet_balances::GenesisConfig::<Test>{
 			balances: vec![(1, 1000), (2, 2000), (3, 3000), (4, 4000)],
 		}.assimilate_storage(&mut t).unwrap();
 		t.into()
@@ -919,7 +936,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into()
 			));
@@ -930,7 +947,7 @@ mod tests {
 			assert_eq!(
 				fund.deploy_data,
 				Some(DeployData {
-					code_hash: <Test as system::Trait>::Hash::default(),
+					code_hash: <Test as frame_system::Trait>::Hash::default(),
 					code_size: 0,
 					initial_head_data: vec![0].into(),
 				}),
@@ -949,7 +966,7 @@ mod tests {
 			assert_noop!(Crowdfund::fix_deploy_data(
 				Origin::signed(2),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into()),
 				Error::<Test>::InvalidOrigin
@@ -959,7 +976,7 @@ mod tests {
 			assert_noop!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				1,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into()),
 				Error::<Test>::InvalidFundIndex
@@ -969,7 +986,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -977,7 +994,7 @@ mod tests {
 			assert_noop!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![1].into()),
 				Error::<Test>::ExistingDeployData
@@ -997,7 +1014,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -1043,7 +1060,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -1071,7 +1088,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -1114,7 +1131,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -1256,7 +1273,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -1285,7 +1302,7 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
@@ -1324,14 +1341,14 @@ mod tests {
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(1),
 				0,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));
 			assert_ok!(Crowdfund::fix_deploy_data(
 				Origin::signed(2),
 				1,
-				<Test as system::Trait>::Hash::default(),
+				<Test as frame_system::Trait>::Hash::default(),
 				0,
 				vec![0].into(),
 			));

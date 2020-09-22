@@ -23,8 +23,9 @@ use bitvec::vec::BitVec;
 use primitives::RuntimeDebug;
 use runtime_primitives::traits::AppVerify;
 use inherents::InherentIdentifier;
+use sp_arithmetic::traits::{BaseArithmetic, Saturating, Zero};
 
-use runtime_primitives::traits::{BlakeTwo256, Hash as HashT};
+pub use runtime_primitives::traits::{BlakeTwo256, Hash as HashT};
 
 // Export some core primitives.
 pub use polkadot_core_primitives::v1::{
@@ -50,6 +51,8 @@ pub use crate::v0::{
 #[cfg(feature = "std")]
 pub use crate::v0::{ValidatorPair, CollatorPair};
 
+pub use sp_staking::SessionIndex;
+
 /// Unique identifier for the Inclusion Inherent
 pub const INCLUSION_INHERENT_IDENTIFIER: InherentIdentifier = *b"inclusn0";
 
@@ -57,14 +60,16 @@ pub const INCLUSION_INHERENT_IDENTIFIER: InherentIdentifier = *b"inclusn0";
 pub fn collator_signature_payload<H: AsRef<[u8]>>(
 	relay_parent: &H,
 	para_id: &Id,
+	persisted_validation_data_hash: &Hash,
 	pov_hash: &Hash,
-) -> [u8; 68] {
+) -> [u8; 100] {
 	// 32-byte hash length is protected in a test below.
-	let mut payload = [0u8; 68];
+	let mut payload = [0u8; 100];
 
 	payload[0..32].copy_from_slice(relay_parent.as_ref());
 	u32::from(*para_id).using_encoded(|s| payload[32..32 + s.len()].copy_from_slice(s));
-	payload[36..68].copy_from_slice(pov_hash.as_ref());
+	payload[36..68].copy_from_slice(persisted_validation_data_hash.as_ref());
+	payload[68..100].copy_from_slice(pov_hash.as_ref());
 
 	payload
 }
@@ -72,11 +77,18 @@ pub fn collator_signature_payload<H: AsRef<[u8]>>(
 fn check_collator_signature<H: AsRef<[u8]>>(
 	relay_parent: &H,
 	para_id: &Id,
+	persisted_validation_data_hash: &Hash,
 	pov_hash: &Hash,
 	collator: &CollatorId,
 	signature: &CollatorSignature,
 ) -> Result<(),()> {
-	let payload = collator_signature_payload(relay_parent, para_id, pov_hash);
+	let payload = collator_signature_payload(
+		relay_parent,
+		para_id,
+		persisted_validation_data_hash,
+		pov_hash,
+	);
+
 	if signature.verify(&payload[..], collator) {
 		Ok(())
 	} else {
@@ -86,7 +98,7 @@ fn check_collator_signature<H: AsRef<[u8]>>(
 
 /// A unique descriptor of the candidate receipt.
 #[derive(PartialEq, Eq, Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Debug, Default))]
+#[cfg_attr(feature = "std", derive(Debug, Default, Hash))]
 pub struct CandidateDescriptor<H = Hash> {
 	/// The ID of the para this is a candidate for.
 	pub para_id: Id,
@@ -94,11 +106,15 @@ pub struct CandidateDescriptor<H = Hash> {
 	pub relay_parent: H,
 	/// The collator's sr25519 public key.
 	pub collator: CollatorId,
-	/// Signature on blake2-256 of components of this receipt:
-	/// The parachain index, the relay parent, and the pov_hash.
-	pub signature: CollatorSignature,
+	/// The blake2-256 hash of the persisted validation data. This is extra data derived from
+	/// relay-chain state which may vary based on bitfields included before the candidate.
+	/// Thus it cannot be derived entirely from the relay-parent.
+	pub persisted_validation_data_hash: Hash,
 	/// The blake2-256 hash of the pov.
 	pub pov_hash: Hash,
+	/// Signature on blake2-256 of components of this receipt:
+	/// The parachain index, the relay parent, the validation data hash, and the pov_hash.
+	pub signature: CollatorSignature,
 }
 
 impl<H: AsRef<[u8]>> CandidateDescriptor<H> {
@@ -107,6 +123,7 @@ impl<H: AsRef<[u8]>> CandidateDescriptor<H> {
 		check_collator_signature(
 			&self.relay_parent,
 			&self.para_id,
+			&self.persisted_validation_data_hash,
 			&self.pov_hash,
 			&self.collator,
 			&self.signature,
@@ -139,18 +156,19 @@ impl<H> CandidateReceipt<H> {
 /// All data pertaining to the execution of a para candidate.
 #[derive(PartialEq, Eq, Clone, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(Debug, Default))]
-pub struct FullCandidateReceipt<H = Hash> {
+pub struct FullCandidateReceipt<H = Hash, N = BlockNumber> {
 	/// The inner candidate receipt.
 	pub inner: CandidateReceipt<H>,
-	/// The global validation schedule.
-	pub global_validation: GlobalValidationSchedule,
-	/// The local validation data.
-	pub local_validation: LocalValidationData,
+	/// The validation data derived from the relay-chain state at that
+	/// point. The hash of the persisted validation data should
+	/// match the `persisted_validation_data_hash` in the descriptor
+	/// of the receipt.
+	pub validation_data: ValidationData<N>,
 }
 
 /// A candidate-receipt with commitments directly included.
 #[derive(PartialEq, Eq, Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Debug, Default))]
+#[cfg_attr(feature = "std", derive(Debug, Default, Hash))]
 pub struct CommittedCandidateReceipt<H = Hash> {
 	/// The descriptor of the candidate.
 	pub descriptor: CandidateDescriptor<H>,
@@ -198,17 +216,78 @@ impl Ord for CommittedCandidateReceipt {
 	}
 }
 
-/// Extra data that is needed along with the other fields in a `CandidateReceipt`
-/// to fully validate the candidate. These fields are parachain-specific.
+/// The validation data provide information about how to validate both the inputs and
+/// outputs of a candidate.
+///
+/// There are two types of validation data: persisted and transient.
+/// Their respective sections of the guide elaborate on their functionality in more detail.
+///
+/// This information is derived from the chain state and will vary from para to para,
+/// although some of the fields may be the same for every para.
+///
+/// Persisted validation data are generally derived from some relay-chain state to form inputs
+/// to the validation function, and as such need to be persisted by the availability system to
+/// avoid dependence on availability of the relay-chain state. The backing phase of the
+/// inclusion pipeline ensures that everything that is included in a valid fork of the
+/// relay-chain already adheres to the transient constraints.
+///
+/// The validation data also serve the purpose of giving collators a means of ensuring that
+/// their produced candidate and the commitments submitted to the relay-chain alongside it
+/// will pass the checks done by the relay-chain when backing, and give validators
+/// the same understanding when determining whether to second or attest to a candidate.
+///
+/// Since the commitments of the validation function are checked by the
+/// relay-chain, secondary checkers can rely on the invariant that the relay-chain
+/// only includes para-blocks for which these checks have already been done. As such,
+/// there is no need for the validation data used to inform validators and collators about
+/// the checks the relay-chain will perform to be persisted by the availability system.
+/// Nevertheless, we expose it so the backing validators can validate the outputs of a
+/// candidate before voting to submit it to the relay-chain and so collators can
+/// collate candidates that satisfy the criteria implied these transient validation data.
 #[derive(PartialEq, Eq, Clone, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(Debug, Default))]
-pub struct LocalValidationData {
+pub struct ValidationData<N = BlockNumber> {
+	/// The persisted validation data.
+	pub persisted: PersistedValidationData<N>,
+	/// The transient validation data.
+	pub transient: TransientValidationData<N>,
+}
+
+/// Validation data that needs to be persisted for secondary checkers.
+#[derive(PartialEq, Eq, Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Debug, Default))]
+pub struct PersistedValidationData<N = BlockNumber> {
 	/// The parent head-data.
 	pub parent_head: HeadData,
+	/// The relay-chain block number this is in the context of.
+	pub block_number: N,
+	/// The list of MQC heads for the inbound channels paired with the sender para ids. This
+	/// vector is sorted ascending by the para id and doesn't contain multiple entries with the same
+	/// sender.
+	pub hrmp_mqc_heads: Vec<(Id, Hash)>,
+}
+
+impl<N: Encode> PersistedValidationData<N> {
+	/// Compute the blake2-256 hash of the persisted validation data.
+	pub fn hash(&self) -> Hash {
+		BlakeTwo256::hash_of(self)
+	}
+}
+
+/// Validation data for checking outputs of the validation-function.
+/// As such, they also inform the collator about how to construct the candidate.
+///
+/// These are transient because they are not necessary beyond the point where the
+/// candidate is backed.
+#[derive(PartialEq, Eq, Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Debug, Default))]
+pub struct TransientValidationData<N = BlockNumber> {
+	/// The maximum code size permitted, in bytes.
+	pub max_code_size: u32,
+	/// The maximum head-data size permitted, in bytes.
+	pub max_head_data_size: u32,
 	/// The balance of the parachain at the moment of validation.
 	pub balance: Balance,
-	/// The blake2-256 hash of the validation code used to execute the candidate.
-	pub validation_code_hash: Hash,
 	/// Whether the parachain is allowed to upgrade its validation code.
 	///
 	/// This is `Some` if so, and contains the number of the minimum relay-chain
@@ -220,27 +299,12 @@ pub struct LocalValidationData {
 	/// height. This may be equal to the current perceived relay-chain block height, in
 	/// which case the code upgrade should be applied at the end of the signaling
 	/// block.
-	pub code_upgrade_allowed: Option<BlockNumber>,
-}
-
-/// Extra data that is needed along with the other fields in a `CandidateReceipt`
-/// to fully validate the candidate.
-///
-/// These are global parameters that apply to all candidates in a block.
-#[derive(PartialEq, Eq, Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Debug, Default))]
-pub struct GlobalValidationSchedule {
-	/// The maximum code size permitted, in bytes.
-	pub max_code_size: u32,
-	/// The maximum head-data size permitted, in bytes.
-	pub max_head_data_size: u32,
-	/// The relay-chain block number this is in the context of.
-	pub block_number: BlockNumber,
+	pub code_upgrade_allowed: Option<N>,
 }
 
 /// Commitments made in a `CandidateReceipt`. Many of these are outputs of validation.
 #[derive(PartialEq, Eq, Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Debug, Default))]
+#[cfg_attr(feature = "std", derive(Debug, Default, Hash))]
 pub struct CandidateCommitments {
 	/// Fees paid from the chain to the relay chain validators.
 	pub fees: Balance,
@@ -278,8 +342,7 @@ impl PoV {
 }
 
 /// A bitfield concerning availability of backed candidates.
-#[derive(PartialEq, Eq, Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug)]
 pub struct AvailabilityBitfield(pub BitVec<bitvec::order::Lsb0, u8>);
 
 impl From<BitVec<bitvec::order::Lsb0, u8>> for AvailabilityBitfield {
@@ -409,70 +472,278 @@ pub enum CoreOccupied {
 	Parachain,
 }
 
-/// The assignment type.
-#[derive(Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
-pub enum AssignmentKind {
-	/// A parachain.
-	Parachain,
-	/// A parathread.
-	Parathread(CollatorId, u32),
-}
-
-/// How a free core is scheduled to be assigned.
-#[derive(Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
-pub struct CoreAssignment {
-	/// The core that is assigned.
-	pub core: CoreIndex,
-	/// The unique ID of the para that is assigned to the core.
-	pub para_id: Id,
-	/// The kind of the assignment.
-	pub kind: AssignmentKind,
-	/// The index of the validator group assigned to the core.
-	pub group_idx: GroupIndex,
-}
-
-impl CoreAssignment {
-	/// Get the ID of a collator who is required to collate this block.
-	pub fn required_collator(&self) -> Option<&CollatorId> {
-		match self.kind {
-			AssignmentKind::Parachain => None,
-			AssignmentKind::Parathread(ref id, _) => Some(id),
-		}
-	}
-
-	/// Get the `CoreOccupied` from this.
-	pub fn to_core_occupied(&self) -> CoreOccupied {
-		match self.kind {
-			AssignmentKind::Parachain => CoreOccupied::Parachain,
-			AssignmentKind::Parathread(ref collator, retries) => CoreOccupied::Parathread(
-				ParathreadEntry {
-					claim: ParathreadClaim(self.para_id, collator.clone()),
-					retries,
-				}
-			),
-		}
-	}
-}
-
-/// Validation data omitted from most candidate descriptor structs, as it can be derived from the
-/// relay-parent.
-#[derive(Clone, Encode, Decode)]
-#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
-pub struct OmittedValidationData {
-	/// The global validation schedule.
-	pub global_validation: GlobalValidationSchedule,
-	/// The local validation data.
-	pub local_validation: LocalValidationData,
-}
-
 /// This is the data we keep available for each candidate included in the relay chain.
 #[derive(Clone, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(PartialEq, Debug))]
 pub struct AvailableData {
 	/// The Proof-of-Validation of the candidate.
 	pub pov: PoV,
-	/// The omitted validation data.
-	pub omitted_validation: OmittedValidationData,
+	/// The persisted validation data needed for secondary checks.
+	pub validation_data: PersistedValidationData,
+}
+
+/// A helper data-type for tracking validator-group rotations.
+#[derive(Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
+pub struct GroupRotationInfo<N = BlockNumber> {
+	/// The block number where the session started.
+	pub session_start_block: N,
+	/// How often groups rotate. 0 means never.
+	pub group_rotation_frequency: N,
+	/// The current block number.
+	pub now: N,
+}
+
+impl GroupRotationInfo {
+	/// Returns the index of the group needed to validate the core at the given index, assuming
+	/// the given number of cores.
+	///
+	/// `core_index` should be less than `cores`, which is capped at u32::max().
+	pub fn group_for_core(&self, core_index: CoreIndex, cores: usize) -> GroupIndex {
+		if self.group_rotation_frequency == 0 { return GroupIndex(core_index.0) }
+		if cores == 0 { return GroupIndex(0) }
+
+		let cores = sp_std::cmp::min(cores, u32::max_value() as usize);
+		let blocks_since_start = self.now.saturating_sub(self.session_start_block);
+		let rotations = blocks_since_start / self.group_rotation_frequency;
+
+		let idx = (core_index.0 as usize + rotations as usize) % cores;
+		GroupIndex(idx as u32)
+	}
+}
+
+impl<N: Saturating + BaseArithmetic + Copy> GroupRotationInfo<N> {
+	/// Returns the block number of the next rotation after the current block. If the current block
+	/// is 10 and the rotation frequency is 5, this should return 15.
+	///
+	/// If the group rotation frequency is 0, returns 0.
+	pub fn next_rotation_at(&self) -> N {
+		if self.group_rotation_frequency.is_zero() { return Zero::zero() }
+
+		let cycle_once = self.now + self.group_rotation_frequency;
+		cycle_once - (
+			cycle_once.saturating_sub(self.session_start_block) % self.group_rotation_frequency
+		)
+	}
+
+	/// Returns the block number of the last rotation before or including the current block. If the
+	/// current block is 10 and the rotation frequency is 5, this should return 10.
+	///
+	/// If the group rotation frequency is 0, returns 0.
+	pub fn last_rotation_at(&self) -> N {
+		if self.group_rotation_frequency.is_zero() { return Zero::zero() }
+		self.now - (
+			self.now.saturating_sub(self.session_start_block) % self.group_rotation_frequency
+		)
+	}
+}
+
+/// Information about a core which is currently occupied.
+#[derive(Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
+pub struct OccupiedCore<N = BlockNumber> {
+	/// The ID of the para occupying the core.
+	pub para_id: Id,
+	/// If this core is freed by availability, this is the assignment that is next up on this
+	/// core, if any. None if there is nothing queued for this core.
+	pub next_up_on_available: Option<ScheduledCore>,
+	/// The relay-chain block number this began occupying the core at.
+	pub occupied_since: N,
+	/// The relay-chain block this will time-out at, if any.
+	pub time_out_at: N,
+	/// If this core is freed by being timed-out, this is the assignment that is next up on this
+	/// core. None if there is nothing queued for this core or there is no possibility of timing
+	/// out.
+	pub next_up_on_time_out: Option<ScheduledCore>,
+	/// A bitfield with 1 bit for each validator in the set. `1` bits mean that the corresponding
+	/// validators has attested to availability on-chain. A 2/3+ majority of `1` bits means that
+	/// this will be available.
+	pub availability: BitVec<bitvec::order::Lsb0, u8>,
+	/// The group assigned to distribute availability pieces of this candidate.
+	pub group_responsible: GroupIndex,
+}
+
+/// Information about a core which is currently occupied.
+#[derive(Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(PartialEq, Debug, Default))]
+pub struct ScheduledCore {
+	/// The ID of a para scheduled.
+	pub para_id: Id,
+	/// The collator required to author the block, if any.
+	pub collator: Option<CollatorId>,
+}
+
+/// The state of a particular availability core.
+#[derive(Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
+pub enum CoreState<N = BlockNumber> {
+	/// The core is currently occupied.
+	#[codec(index = "0")]
+	Occupied(OccupiedCore<N>),
+	/// The core is currently free, with a para scheduled and given the opportunity
+	/// to occupy.
+	///
+	/// If a particular Collator is required to author this block, that is also present in this
+	/// variant.
+	#[codec(index = "1")]
+	Scheduled(ScheduledCore),
+	/// The core is currently free and there is nothing scheduled. This can be the case for parathread
+	/// cores when there are no parathread blocks queued. Parachain cores will never be left idle.
+	#[codec(index = "2")]
+	Free,
+}
+
+impl<N> CoreState<N> {
+	/// If this core state has a `para_id`, return it.
+	pub fn para_id(&self) -> Option<Id> {
+		match self {
+			Self::Occupied(OccupiedCore { para_id, ..}) => Some(*para_id),
+			Self::Scheduled(ScheduledCore { para_id, .. }) => Some(*para_id),
+			Self::Free => None,
+		}
+	}
+}
+
+/// An assumption being made about the state of an occupied core.
+#[derive(Clone, Copy, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
+pub enum OccupiedCoreAssumption {
+	/// The candidate occupying the core was made available and included to free the core.
+	#[codec(index = "0")]
+	Included,
+	/// The candidate occupying the core timed out and freed the core without advancing the para.
+	#[codec(index = "1")]
+	TimedOut,
+	/// The core was not occupied to begin with.
+	#[codec(index = "2")]
+	Free,
+}
+
+/// An even concerning a candidate.
+#[derive(Clone, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(PartialEq, Debug))]
+pub enum CandidateEvent<H = Hash> {
+	/// This candidate receipt was backed in the most recent block.
+	#[codec(index = "0")]
+	CandidateBacked(CandidateReceipt<H>, HeadData),
+	/// This candidate receipt was included and became a parablock at the most recent block.
+	#[codec(index = "1")]
+	CandidateIncluded(CandidateReceipt<H>, HeadData),
+	/// This candidate receipt was not made available in time and timed out.
+	#[codec(index = "2")]
+	CandidateTimedOut(CandidateReceipt<H>, HeadData),
+}
+
+sp_api::decl_runtime_apis! {
+	/// The API for querying the state of parachains on-chain.
+	pub trait ParachainHost<H: Decode = Hash, N: Decode = BlockNumber> {
+		/// Get the current validators.
+		fn validators() -> Vec<ValidatorId>;
+
+		/// Returns the validator groups and rotation info localized based on the block whose state
+		/// this is invoked on. Note that `now` in the `GroupRotationInfo` should be the successor of
+		/// the number of the block.
+		fn validator_groups() -> (Vec<Vec<ValidatorIndex>>, GroupRotationInfo<N>);
+
+		/// Yields information on all availability cores. Cores are either free or occupied. Free
+		/// cores can have paras assigned to them.
+		fn availability_cores() -> Vec<CoreState<N>>;
+
+		/// Yields the full validation data for the given ParaId along with an assumption that
+		/// should be used if the para currently occupieds a core.
+		///
+		/// Returns `None` if either the para is not registered or the assumption is `Freed`
+		/// and the para already occupies a core.
+		fn full_validation_data(para_id: Id, assumption: OccupiedCoreAssumption)
+			-> Option<ValidationData<N>>;
+
+		/// Yields the persisted validation data for the given ParaId along with an assumption that
+		/// should be used if the para currently occupies a core.
+		///
+		/// Returns `None` if either the para is not registered or the assumption is `Freed`
+		/// and the para already occupies a core.
+		fn persisted_validation_data(para_id: Id, assumption: OccupiedCoreAssumption)
+			-> Option<PersistedValidationData<N>>;
+
+		/// Returns the session index expected at a child of the block.
+		///
+		/// This can be used to instantiate a `SigningContext`.
+		fn session_index_for_child() -> SessionIndex;
+
+		/// Fetch the validation code used by a para, making the given `OccupiedCoreAssumption`.
+		///
+		/// Returns `None` if either the para is not registered or the assumption is `Freed`
+		/// and the para already occupies a core.
+		fn validation_code(para_id: Id, assumption: OccupiedCoreAssumption)
+			-> Option<ValidationCode>;
+
+		/// Get the receipt of a candidate pending availability. This returns `Some` for any paras
+		/// assigned to occupied cores in `availability_cores` and `None` otherwise.
+		fn candidate_pending_availability(para_id: Id) -> Option<CommittedCandidateReceipt<H>>;
+
+		/// Get a vector of events concerning candidates that occurred within a block.
+		// NOTE: this needs to skip block initialization as events are wiped within block
+		// initialization.
+		#[skip_initialize_block]
+		fn candidate_events() -> Vec<CandidateEvent<H>>;
+	}
+}
+
+/// Custom validity errors used in Polkadot while validating transactions.
+#[repr(u8)]
+pub enum ValidityError {
+	/// The Ethereum signature is invalid.
+	InvalidEthereumSignature = 0,
+	/// The signer has no claim.
+	SignerHasNoClaim = 1,
+	/// No permission to execute the call.
+	NoPermission = 2,
+	/// An invalid statement was made for a claim.
+	InvalidStatement = 3,
+}
+
+impl From<ValidityError> for u8 {
+	fn from(err: ValidityError) -> Self {
+		err as u8
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn group_rotation_info_calculations() {
+		let info = GroupRotationInfo {
+			session_start_block: 10u32,
+			now: 15,
+			group_rotation_frequency: 5,
+		};
+
+		assert_eq!(info.next_rotation_at(), 20);
+		assert_eq!(info.last_rotation_at(), 15);
+
+		let info = GroupRotationInfo {
+			session_start_block: 10u32,
+			now: 11,
+			group_rotation_frequency: 0,
+		};
+
+		assert_eq!(info.next_rotation_at(), 0);
+		assert_eq!(info.last_rotation_at(), 0);
+	}
+
+	#[test]
+	fn collator_signature_payload_is_valid() {
+		// if this fails, collator signature verification code has to be updated.
+		let h = Hash::default();
+		assert_eq!(h.as_ref().len(), 32);
+
+		let _payload = collator_signature_payload(
+			&Hash::from([1; 32]),
+			&5u32.into(),
+			&Hash::from([2; 32]),
+			&Hash::from([3; 32]),
+		);
+	}
 }

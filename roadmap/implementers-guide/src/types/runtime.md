@@ -24,7 +24,7 @@ struct HostConfiguration {
 	/// The number of retries that a parathread author has to submit their block.
 	pub parathread_retries: u32,
 	/// How often parachain groups should be rotated across parachains.
-	pub parachain_rotation_frequency: BlockNumber,
+	pub group_rotation_frequency: BlockNumber,
 	/// The availability period, in blocks, for parachains. This is the amount of blocks
 	/// after inclusion that validators have to make the block available and signal its availability to
 	/// the chain. Must be at least 1.
@@ -39,6 +39,48 @@ struct HostConfiguration {
 	/// Total size of messages allowed in the parachain -> relay-chain message queue before which
 	/// no further messages may be added to it. If it exceeds this then the queue may contain only
 	/// a single message.
-	pub watermark_upward_queue_size: u32,
+	pub max_upward_queue_size: u32,
+	/// The amount of weight we wish to devote to the processing the dispatchable upward messages
+	/// stage.
+	///
+	/// NOTE that this is a soft limit and could be exceeded.
+	pub preferred_dispatchable_upward_messages_step_weight: u32,
+	/// Any dispatchable upward message that requests more than the critical amount is rejected.
+	///
+	/// The parameter value is picked up so that no dispatchable can make the block weight exceed
+	/// the total budget. I.e. that the sum of `preferred_dispatchable_upward_messages_step_weight`
+	/// and `dispatchable_upward_message_critical_weight` doesn't exceed the amount of weight left
+	/// under a typical worst case (e.g. no upgrades, etc) weight consumed by the required phases of
+	/// block execution (i.e. initialization, finalization and inherents).
+	pub dispatchable_upward_message_critical_weight: u32,
+	/// The maximum number of messages that a candidate can contain.
+	pub max_upward_message_num_per_candidate: u32,
+	/// The maximum size of a message that can be put in a downward message queue.
+	///
+	/// Since we require receiving at least one DMP message the obvious upper bound of the size is
+	/// the PoV size. Of course, there is a lot of other different things that a parachain may
+	/// decide to do with its PoV so this value in practice will be picked as a fraction of the PoV
+	/// size.
+	pub critical_downward_message_size: u32,
+	/// Number of sessions after which an HRMP open channel request expires.
+	pub hrmp_open_request_ttl: u32,
+	/// The deposit that the sender should provide for opening an HRMP channel.
+	pub hrmp_sender_deposit: u32,
+	/// The deposit that the recipient should provide for accepting opening an HRMP channel.
+	pub hrmp_recipient_deposit: u32,
+	/// The maximum number of messages allowed in an HRMP channel at once.
+	pub hrmp_channel_max_places: u32,
+	/// The maximum total size of messages in bytes allowed in an HRMP channel at once.
+	pub hrmp_channel_max_size: u32,
+	/// The maximum number of inbound HRMP channels a parachain is allowed to accept.
+	pub hrmp_max_parachain_inbound_channels: u32,
+	/// The maximum number of inbound HRMP channels a parathread is allowed to accept.
+	pub hrmp_max_parathread_inbound_channels: u32,
+	/// The maximum size of a message that could ever be put into an HRMP channel.
+	pub hrmp_channel_max_message_size: u32,
+	/// The maximum number of outbound HRMP channels a parachain is allowed to open.
+	pub hrmp_max_parachain_outbound_channels: u32,
+	/// The maximum number of outbound HRMP channels a parathread is allowed to open.
+	pub hrmp_max_parathread_outbound_channels: u32,
 }
 ```
